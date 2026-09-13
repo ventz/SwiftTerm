@@ -96,6 +96,15 @@ public extension Notification.Name {
  *
  * Use the `configureNativeColors()` to set the defaults colors for the view to match the OS
  * defaults, otherwise, this uses its own set of defaults colors.
+ *
+ * ## Terminal ownership
+ *
+ * `TerminalView` owns its mutable `Terminal`. It does not expose that terminal.
+ * Parsing, rendering, and input can occur on different threads. Use copied reads
+ * such as ``terminalDimensions``, ``terminalStateSnapshot()``, and
+ * ``getBufferAsData(kind:encoding:)``. Use ``feed(byteArray:)`` for received
+ * output and ``send(data:)`` for user input. Use ``pasteText(_:)`` for text
+ * paste. See <doc:MigratingFrom1To2> for the complete access map.
  */
 open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollViewDelegate, TerminalDelegate, UIPointerInteractionDelegate {
     let coreGraphicsRenderCache = CoreGraphicsRenderCache()
@@ -2979,7 +2988,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// Starts auto-repeat for `keyCode`. As with a hardware keyboard, only
     /// the most recent key repeats, so any other repeat stops first. The
     /// release of a different key does not stop this repeat.
-    private func startKeyRepeat(for keyCode: UIKeyboardHIDUsage,
+    private final func startKeyRepeat(for keyCode: UIKeyboardHIDUsage,
                                 _ tick: @escaping @MainActor @Sendable (TerminalView) -> Void) {
         stopAllKeyRepeats()
         let timer = Timer(fire: Date(timeInterval: 0.4, since: Date()),

@@ -298,11 +298,27 @@ final class TerminalRenderOwner: Sendable {
         }
     }
 
+    func keyboardEnhancementFlags() -> KittyKeyboardFlags {
+        guard let terminal = currentSession()?.terminal else {
+            return []
+        }
+        return terminal.terminalLock.withLock {
+            terminal.keyboardEnhancementFlags
+        }
+    }
+
     func bufferData(kind: Terminal.BufferKind,
                     encoding: String.Encoding) -> Data {
         guard let terminal = currentSession()?.terminal else { return Data() }
         return terminal.terminalLock.withLock {
             terminal.getBufferAsData(kind: kind, encoding: encoding)
+        }
+    }
+
+    func setCursorStyle(_ style: CursorStyle) {
+        guard let terminal = currentSession()?.terminal else { return }
+        terminal.terminalLock.withLock {
+            terminal.setCursorStyle(style)
         }
     }
 
@@ -334,6 +350,7 @@ final class TerminalRenderOwner: Sendable {
                 dimensions: TerminalDimensions(cols: 0, rows: 0),
                 cursor: Position(col: 0, row: 0),
                 viewportRow: 0,
+                bracketedPasteMode: false,
                 currentBidiState: .default,
                 bidiArrowKeySwap: false,
                 cursorStyle: .blinkBlock,
@@ -366,6 +383,7 @@ final class TerminalRenderOwner: Sendable {
                         cols: terminal.cols, rows: terminal.rows),
                     cursor: Position(col: buffer.x, row: buffer.y),
                     viewportRow: buffer.yDisp,
+                    bracketedPasteMode: terminal.bracketedPasteMode,
                     currentBidiState: terminal.currentBidiState,
                     bidiArrowKeySwap: terminal.bidiArrowKeySwap,
                     cursorStyle: terminal.options.cursorStyle,
