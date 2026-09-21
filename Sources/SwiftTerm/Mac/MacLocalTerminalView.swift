@@ -324,7 +324,11 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
         processDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
     }
     
-    public func clipboardCopy(source: TerminalView, content: Data) {
+    /// OSC 52 clipboard write. `open` so the host application can decide
+    /// whether output from the terminal may replace the user's clipboard;
+    /// a program in the terminal is not necessarily someone the user trusts
+    /// with it, and the right policy is the embedding app's call.
+    open func clipboardCopy(source: TerminalView, content: Data) {
         if let str = String (bytes: content, encoding: .utf8) {
             let pasteBoard = NSPasteboard.general
             pasteBoard.clearContents()
@@ -332,7 +336,10 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
         }
     }
     
-    public func clipboardRead(source: TerminalView) -> Data? {
+    /// OSC 52 clipboard read. `open` so the host application can refuse it:
+    /// answering hands the clipboard's contents to whatever is running in the
+    /// terminal, including a remote host over ssh, with no user action.
+    open func clipboardRead(source: TerminalView) -> Data? {
         guard let str = NSPasteboard.general.string(forType: .string) else {
             return nil
         }
