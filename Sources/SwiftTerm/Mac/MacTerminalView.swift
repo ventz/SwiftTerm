@@ -4267,7 +4267,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// terminal lock: `shouldTrackMouse` ran 1 611 times in one measured run.
     nonisolated private let mouseModeState = Locked(Terminal.MouseMode.off)
 
-    var currentMouseMode: Terminal.MouseMode {
+    /// The mouse reporting mode the application running in the terminal
+    /// last requested. It never takes the terminal lock, so it is safe to
+    /// read from event handlers on the main thread.
+    ///
+    /// Embedders read it to decide whether a click belongs to the
+    /// application: a host that opens a context menu on control-click can
+    /// leave the click to a program that asked for mouse events.
+    public var currentMouseMode: Terminal.MouseMode {
         mouseModeState.withLock { $0 }
     }
 

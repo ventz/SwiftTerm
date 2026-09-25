@@ -132,6 +132,19 @@ struct MouseTrackingTests {
         }
     }
 
+    @Test @MainActor func currentMouseModeFollowsTheApplication() async {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        #expect(view.currentMouseMode == .off)
+
+        view.feed(text: "\(esc)[?1000h")
+        await waitForTerminalViewCallbacks()
+        #expect(view.currentMouseMode == .vt200)
+
+        view.feed(text: "\(esc)[?1000l")
+        await waitForTerminalViewCallbacks()
+        #expect(view.currentMouseMode == .off)
+    }
+
     @Test @MainActor func commandReleaseDeregistersUnusedMouseTracking() {
         let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
         view.commandActive = true
