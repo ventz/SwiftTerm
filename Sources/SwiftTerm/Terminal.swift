@@ -2811,21 +2811,16 @@ open class Terminal {
     }
 
     /// The current buffer-absolute row of a line captured earlier, or nil if
-    /// scrollback trimming or recycling has since destroyed it. A deferred
-    /// pointer click captures the clicked line's identity **and its
-    /// `recycleGeneration`**, and re-resolves here at fire time: identity
-    /// alone is insufficient because `CircularList.recycle` keeps the trimmed
-    /// object in the array as the new bottom row, so a generation mismatch
-    /// means the object was reused for different content and the click is
-    /// dropped.
+    /// scrollback trimming or recycling has since destroyed it. Hosts that
+    /// defer an action can use the line identity and `recycleGeneration` to
+    /// check that the line still holds the same content.
     public func semanticRow(forLineIdentity line: BufferLine,
                             recycleGeneration: UInt64) -> Int? {
         guard line.recycleGeneration == recycleGeneration else { return nil }
         return buffer.absoluteRow(of: line)
     }
 
-    /// The `BufferLine` at a buffer-absolute row, for a view to capture a
-    /// click target's identity before deferring.
+    /// The `BufferLine` at a buffer-absolute row.
     public func bufferLine(atRow row: Int) -> BufferLine? {
         guard row >= 0, row < buffer.lines.count else { return nil }
         return buffer.lines[row]
@@ -3202,16 +3197,16 @@ open class Terminal {
         return data.isEmpty ? nil : data
     }
 
-    /// R6: the shared arbiter entry point for the views. The snapshot was
-    /// captured at press time, before any handler mutated view state; the
-    /// click that dismisses a selection, a drag, and multi-clicks are
-    /// selection gestures and never reach the semantic route.
+    /// R6: the shared arbiter entry point for the views. A fresh single click
+    /// can clear an old selection and route if no selection remains at release.
+    /// A drag, an active selection at release, and multi-clicks cannot route.
     @discardableResult
     public func handleSemanticPromptClick(at position: Position,
                                           modifiers: SemanticPromptClickModifiers,
                                           snapshot: SemanticPromptPointerSnapshot) -> Bool {
         guard snapshot.pressWasSemanticEligible,
-              snapshot.clickCount == 1, !snapshot.didDrag, !snapshot.selectionWasActive else {
+              snapshot.clickCount == 1, !snapshot.didDrag,
+              !snapshot.selectionIsActiveAtRelease else {
             return false
         }
         return handleSemanticPromptClick(at: position, modifiers: modifiers)
@@ -3219,17 +3214,15 @@ open class Terminal {
 
     /// A cheap pre-check (no geometry, no routing) of whether a completed
     /// primary click could possibly route to the semantic prompt: the press
-    /// was semantic-eligible and single, no drag or active selection, the
-    /// modifier policy allows it, we are on the normal buffer, the buffer is
-    /// armed, and a click mode is set. Views use it to avoid scheduling a
-    /// deferral (retaining a line, arming a timer) when routing can never
-    /// apply — for example before any OSC 133 has been seen (F.5).
+    /// was semantic-eligible and single, no drag or active selection at
+    /// release, the modifier policy allows it, we are on the normal buffer,
+    /// the buffer is armed, and a click mode is set.
     public func mightRouteSemanticPromptClick(modifiers: SemanticPromptClickModifiers,
                                               snapshot: SemanticPromptPointerSnapshot) -> Bool {
         guard snapshot.pressWasSemanticEligible,
               snapshot.clickCount == 1,
               !snapshot.didDrag,
-              !snapshot.selectionWasActive,
+              !snapshot.selectionIsActiveAtRelease,
               semanticPromptModifiersAllow(modifiers),
               !isCurrentBufferAlternate,
               buffer.semanticInput == .armed,
@@ -4409,7 +4402,11 @@ open class Terminal {
         if marginMode {
             if buffer.x >= buffer.marginLeft && buffer.x <= buffer.marginRight {
                 let columnCount = buffer.marginRight-buffer.marginLeft+1
-                let rowCount = buffer.scrollBottom-buffer.scrollTop
+                // Rows between the cursor and the bottom of the scroll region.
+                // The shift below starts at the cursor row, not at scrollTop,
+                // so using the region's full height here walks past the last
+                // line of the buffer.
+                let rowCount = buffer.scrollBottom-buffer.y
                 for i in 0...rowCount {
                     repairWideCellsForColumnRestrictedShift(row: row + i)
                 }
@@ -7144,9 +7141,14 @@ open class Terminal {
         let eraseBlank = currentEraseBlankCell
         
         if marginMode {
-            if buffer.x >= buffer.marginLeft && buffer.x <= buffer.marginRight {
+            // The non-margin branch below only acts when the cursor is inside
+            // the vertical scroll region; this branch has to agree with it.
+            if buffer.x >= buffer.marginLeft && buffer.x <= buffer.marginRight,
+               buffer.y >= buffer.scrollTop, buffer.y <= buffer.scrollBottom {
                 let columnCount = buffer.marginRight-buffer.marginLeft+1
-                let rowCount = buffer.scrollBottom-buffer.scrollTop
+                // Rows between the cursor and the bottom of the scroll region;
+                // see the matching comment in cmdInsertLines.
+                let rowCount = buffer.scrollBottom-buffer.y
                 for i in 0...rowCount {
                     repairWideCellsForColumnRestrictedShift(row: row + i)
                 }
@@ -9212,8 +9214,8 @@ open class Terminal {
         let trailingSpacesAtEOL = #"(?: +(?= *$))?"#
         let dottedPathLookahead = #"(?=[\w\-.~:\/?#@!$&*+;=%]*\.)"#
         let nonDottedPathLookahead = #"(?![\w\-.~:\/?#@!$&*+;=%]*\.)"#
-        let dottedPathSpaceSegments = #"(?:(?<!:) (?!\w+:\/\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*"#
-        let anyPathSpaceSegments = #"(?:(?<!:) (?!\w+:\/\/)[\w\-.~:\/?#@!$&*+;=%]+)*"#
+        let dottedPathSpaceSegments = #"(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*"#
+        let anyPathSpaceSegments = #"(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*"#
 
         // The body used to be `(?:IPV6|CHARS+SUFFIX?)+`: a `+` nested directly inside a `+`, so a
         // run of N body characters could be split across iterations in exponentially many ways.
