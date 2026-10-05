@@ -1489,21 +1489,21 @@ extension Terminal {
     #endif
 
     #if !os(Windows) && !os(WASI) && !os(Android)
-    /// The name must look like a POSIX shared memory object: one leading
-    /// slash, no other slash, printable ASCII, and short enough for the
-    /// platform. The name comes from terminal output, and reading an object
-    /// also unlinks it, so anything else is refused before it is opened.
+    /// A POSIX shared memory name: one leading slash, no other slash, and
+    /// within the platform's length limit (the checks Ghostty makes). The
+    /// name comes from terminal output and the object is unlinked once
+    /// opened, so anything else is refused before it is opened.
     static func isPlausibleSharedMemoryName(_ name: String) -> Bool {
         #if canImport(Darwin)
-        let maxLength = 31   // PSHMNAMLEN
+        let maxLength = 31   // PSHMNAMLEN, counting the slash
         #else
-        let maxLength = 255  // NAME_MAX
+        let maxLength = 256  // the slash, then NAME_MAX
         #endif
         let bytes = Array(name.utf8)
         guard bytes.count >= 2, bytes.count <= maxLength, bytes[0] == UInt8(ascii: "/") else {
             return false
         }
-        return bytes.dropFirst().allSatisfy { $0 > 0x20 && $0 < 0x7f && $0 != UInt8(ascii: "/") }
+        return !bytes.dropFirst().contains(UInt8(ascii: "/"))
     }
 
     private func readKittySharedMemory(name: String, expectedSize: Int?, offset: Int, size: Int) -> Data? {
@@ -1518,6 +1518,7 @@ extension Terminal {
         }
         defer {
             close(fd)
+            _ = name.withCString { shm_unlink($0) }
         }
 
         var st = stat()
@@ -1534,12 +1535,13 @@ extension Terminal {
         if let expectedSize, statSize < expectedSize {
             return nil
         }
-        // S= counts from O=; without it, the image's own size does, or the
-        // rest of the object when the size is not known up front.
+        // S= counts from O= and is clamped to the object, as kitty does;
+        // without it, the image's own size counts from O=, or the rest of
+        // the object when the size is not known up front.
         let start = offset
         let end: Int
         if size > 0 {
-            end = offset + size
+            end = min(offset + size, statSize)
         } else if let expectedSize {
             end = offset + expectedSize
         } else {
@@ -1557,12 +1559,8 @@ extension Terminal {
             munmap(map, statSize)
         }
 
-        let data = Data(bytes: map.advanced(by: start), count: end - start)
-        // Unlinked only once it was read as an image would be: an object
-        // that does not fit the request is left alone rather than deleted
-        // on the say-so of terminal output.
-        _ = name.withCString { shm_unlink($0) }
-        return data
+        let startPtr = map.advanced(by: start)
+        return Data(bytes: startPtr, count: end - start)
     }
     #endif
 

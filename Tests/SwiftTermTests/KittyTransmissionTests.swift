@@ -257,6 +257,8 @@ final class KittyTransmissionTests {
         }
         defer { _ = name.withCString { shm_unlink($0) } }
 
+        // macOS rounds a shared memory object up to a whole page (16 KiB
+        // on Apple silicon), so a small offset would still be inside it.
         sendKitty(terminal: t,
                   control: "f=24,s=1,v=1,t=s,i=1,O=1048576",
                   payload: Data(name.utf8))
@@ -265,26 +267,52 @@ final class KittyTransmissionTests {
     }
     #endif
 
-    #if !os(Windows)
-    @Test func testSharedMemoryNamesMustLookLikeShmObjects() {
+    #if !os(Windows) && !os(WASI) && !os(Android)
+    @Test func testKittySharedMemoryNameValidation() {
         #expect(Terminal.isPlausibleSharedMemoryName("/im3f2a-0"))
-        #expect(Terminal.isPlausibleSharedMemoryName("/tty-graphics-protocol-1"))
+        #expect(Terminal.isPlausibleSharedMemoryName("/kitty img 1"))
         #expect(!Terminal.isPlausibleSharedMemoryName(""))
         #expect(!Terminal.isPlausibleSharedMemoryName("/"))
         #expect(!Terminal.isPlausibleSharedMemoryName("noslash"))
         #expect(!Terminal.isPlausibleSharedMemoryName("/a/b"))
-        #expect(!Terminal.isPlausibleSharedMemoryName("/with space"))
-        #expect(!Terminal.isPlausibleSharedMemoryName("/tab\there"))
-        #expect(!Terminal.isPlausibleSharedMemoryName("/caf\u{e9}"))
         #if canImport(Darwin)
+        #expect(Terminal.isPlausibleSharedMemoryName("/" + String(repeating: "a", count: 30)))
         #expect(!Terminal.isPlausibleSharedMemoryName("/" + String(repeating: "a", count: 31)))
+        #else
+        #expect(Terminal.isPlausibleSharedMemoryName("/" + String(repeating: "a", count: 255)))
+        #expect(!Terminal.isPlausibleSharedMemoryName("/" + String(repeating: "a", count: 256)))
         #endif
     }
 
-    /// The exact shape Claude Code sends for a plugin frame (intermission):
-    /// raw RGB in an object the plugin named, with Unicode placeholders.
+    private static func reopenSharedMemory(_ name: String) -> (fd: Int32, error: Int32) {
+        name.withCString { path in
+            let fd = KittyTransmissionTests.swiftShmOpen(path, O_RDONLY, 0)
+            return (fd, fd < 0 ? errno : 0)
+        }
+    }
+
+    private static func sharedMemoryIsGone(_ name: String) -> Bool {
+        let result = reopenSharedMemory(name)
+        if result.fd >= 0 {
+            close(result.fd)
+            return false
+        }
+        return result.error == ENOENT
+    }
+
+    private static func sharedMemoryStillExists(_ name: String) -> Bool {
+        let result = reopenSharedMemory(name)
+        guard result.fd >= 0 else {
+            return false
+        }
+        close(result.fd)
+        return true
+    }
+
+    /// Raw RGB with s= and v= but no S= or O=, sent with U=1 for Unicode
+    /// placeholder display: the shape Claude Code uses for plugin frames.
     @Test(.enabled(if: KittyTransmissionTests.sharedMemoryAvailable()))
-    func testClaudeCodePluginFrameLoads() throws {
+    func testKittyUnicodePlaceholderFrameFromSharedMemory() throws {
         let configuration = KittyGraphicsConfiguration(localMediaPolicy: [.sharedMemory])
         let (t, delegate) = TerminalTestHarness.makeTerminal(
             cols: 10, rows: 5, kittyGraphics: configuration)
@@ -305,18 +333,18 @@ final class KittyTransmissionTests {
         #expect(
             t.kittyGraphicsState.imagesById[5] != nil,
             "response: \(delegate.sentData.last.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
-        let reopen = name.withCString { KittyTransmissionTests.swiftShmOpen($0, O_RDONLY, 0) }
-        #expect(reopen < 0)
+        #expect(Self.sharedMemoryIsGone(name))
     }
 
     @Test(.enabled(if: KittyTransmissionTests.sharedMemoryAvailable()))
-    func testSharedMemoryNameWithoutLeadingSlashIsNeverOpened() throws {
+    func testKittySharedMemoryNameWithoutLeadingSlashIsRefused() throws {
         let configuration = KittyGraphicsConfiguration(localMediaPolicy: .all)
         let (t, _) = TerminalTestHarness.makeTerminal(
             cols: 10, rows: 5, kittyGraphics: configuration)
 
-        // macOS accepts this name, so the object exists and would be read
-        // and unlinked if the name were not checked first.
+        // The OS accepts this name, so the object exists; a valid open
+        // would read it and unlink it, so finding it still there shows the
+        // name was refused.
         let name = "st\(UUID().uuidString.prefix(12))"
         let createResult = Self.createSharedMemory(name: name, bytes: [1, 2, 3])
         guard createResult.ok else {
@@ -330,40 +358,11 @@ final class KittyTransmissionTests {
                   payload: Data(name.utf8))
 
         #expect(t.kittyGraphicsState.imagesById[1] == nil)
-        let reopen = name.withCString { KittyTransmissionTests.swiftShmOpen($0, O_RDONLY, 0) }
-        #expect(reopen >= 0)
-        if reopen >= 0 { close(reopen) }
+        #expect(Self.sharedMemoryStillExists(name))
     }
 
     @Test(.enabled(if: KittyTransmissionTests.sharedMemoryAvailable()))
-    func testSharedMemoryTooSmallForTheImageIsLeftAlone() throws {
-        let configuration = KittyGraphicsConfiguration(localMediaPolicy: .all)
-        let (t, _) = TerminalTestHarness.makeTerminal(
-            cols: 10, rows: 5, kittyGraphics: configuration)
-
-        // macOS rounds an object up to a whole page (16 KiB on Apple
-        // silicon), so "too small" has to be measured past that.
-        let name = "/st\(UUID().uuidString.prefix(12))"
-        let createResult = Self.createSharedMemory(name: name, bytes: [UInt8](repeating: 1, count: 16384))
-        guard createResult.ok else {
-            Issue.record("shm_open unavailable (errno=\(createResult.errorCode))")
-            return
-        }
-        defer { _ = name.withCString { shm_unlink($0) } }
-
-        // 4000x8 RGB needs 96,000 bytes; the object holds 16,384.
-        sendKitty(terminal: t,
-                  control: "f=24,s=4000,v=8,t=s,i=1",
-                  payload: Data(name.utf8))
-
-        #expect(t.kittyGraphicsState.imagesById[1] == nil)
-        let reopen = name.withCString { KittyTransmissionTests.swiftShmOpen($0, O_RDONLY, 0) }
-        #expect(reopen >= 0)
-        if reopen >= 0 { close(reopen) }
-    }
-
-    @Test(.enabled(if: KittyTransmissionTests.sharedMemoryAvailable()))
-    func testSharedMemoryOffsetCountsTheImageFromTheOffset() throws {
+    func testKittySharedMemoryOffsetCountsTheImageFromTheOffset() throws {
         let configuration = KittyGraphicsConfiguration(localMediaPolicy: .all)
         let (t, _) = TerminalTestHarness.makeTerminal(
             cols: 10, rows: 5, kittyGraphics: configuration)
@@ -380,7 +379,43 @@ final class KittyTransmissionTests {
                   control: "f=24,s=1,v=1,t=s,i=1,O=2",
                   payload: Data(name.utf8))
 
-        #expect(t.kittyGraphicsState.imagesById[1] != nil)
+        guard let image = t.kittyGraphicsState.imagesById[1] else {
+            Issue.record("image not loaded")
+            return
+        }
+        switch image.payload {
+        case .rgba(let bytes, _, _):
+            #expect(bytes == [1, 2, 3, 255])
+        }
+    }
+
+    @Test(.enabled(if: KittyTransmissionTests.sharedMemoryAvailable()))
+    func testKittySharedMemorySizeIsClampedToTheObject() throws {
+        let configuration = KittyGraphicsConfiguration(localMediaPolicy: .all)
+        let (t, _) = TerminalTestHarness.makeTerminal(
+            cols: 10, rows: 5, kittyGraphics: configuration)
+
+        let name = "/st\(UUID().uuidString.prefix(12))"
+        let createResult = Self.createSharedMemory(name: name, bytes: [9, 1, 2, 3])
+        guard createResult.ok else {
+            Issue.record("shm_open unavailable (errno=\(createResult.errorCode))")
+            return
+        }
+        defer { _ = name.withCString { shm_unlink($0) } }
+
+        // S= runs past the end of the object; kitty reads what is there.
+        sendKitty(terminal: t,
+                  control: "f=24,s=1,v=1,t=s,i=1,O=1,S=1048576",
+                  payload: Data(name.utf8))
+
+        guard let image = t.kittyGraphicsState.imagesById[1] else {
+            Issue.record("image not loaded")
+            return
+        }
+        switch image.payload {
+        case .rgba(let bytes, _, _):
+            #expect(bytes == [1, 2, 3, 255])
+        }
     }
     #endif
 
