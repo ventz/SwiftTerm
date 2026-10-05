@@ -12,6 +12,9 @@ import WASILibc
 // The Swift Static Linux SDK builds against musl, where the C library module
 // is `Musl` and `Glibc` does not exist.
 import Musl
+#elseif canImport(Android)
+// Bionic, as the Swift Android SDK names it; Android has no `Glibc`.
+import Android
 #elseif canImport(Glibc)
 import Glibc
 #elseif os(Windows)
@@ -35,7 +38,8 @@ import PNG
 import LZ77
 #endif
 
-#if !os(Windows) && !os(WASI)
+// Android's Bionic has no POSIX shared memory (`shm_open`).
+#if !os(Windows) && !os(WASI) && !os(Android)
 @_silgen_name("shm_open")
 private func swiftShmOpen(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32
 #endif
@@ -1328,7 +1332,7 @@ extension Terminal {
     }
 
     private func loadKittySharedMemoryPayload(control: KittyGraphicsControl, base64Payload: [UInt8]) -> (payload: KittyGraphicsPayload?, errorMessage: String?) {
-        #if os(Windows) || os(WASI)
+        #if os(Windows) || os(WASI) || os(Android)
         return (nil, "ENOTSUP: unsupported transmission")
         #else
         guard let pathData = decodeKittyBase64Payload(base64Payload), !pathData.isEmpty else {
@@ -1484,7 +1488,7 @@ extension Terminal {
     }
     #endif
 
-    #if !os(Windows) && !os(WASI)
+    #if !os(Windows) && !os(WASI) && !os(Android)
     /// The name must look like a POSIX shared memory object: one leading
     /// slash, no other slash, printable ASCII, and short enough for the
     /// platform. The name comes from terminal output, and reading an object

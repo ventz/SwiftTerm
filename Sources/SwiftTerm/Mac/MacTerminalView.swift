@@ -1017,7 +1017,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         guard uiShutdownState == .active, terminal != nil else { return }
         let focused = hasFocus
         // Releases can be lost when either the responder or the key window changes.
-        if !focused { kittyKeysWithoutReportedPress.removeAll() }
+        if !focused { kittyKeysWithReportedPress.removeAll() }
         withTerminal { terminal in
             if terminal.reportedFocusState != focused {
                 terminal.setTerminalFocus(focused)
@@ -2006,7 +2006,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     private var pendingKittyKeyEvent: PendingKittyKeyEvent?
     private var kittyIsComposing = false
-    private var kittyKeysWithoutReportedPress: Set<UInt16> = []
     /// The key code of the last key that the input method interpreted
     /// during a preedit. Cleared by the next key down or by its key up.
     private var kittyComposingKeyCode: UInt16?
@@ -2023,20 +2022,57 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // AppKit offers key equivalents to every view in the window, so only
+        // the focused terminal can take the key for its program.
+        guard event.type == .keyDown,
+              let window, window.isKeyWindow, window.firstResponder === self,
+              event.modifierFlags.contains(.command),
+              withTerminal({ !$0.keyboardEnhancementFlags.isEmpty }),
+              shouldSendCommandKeyToTerminal?(event) == true else {
+            return super.performKeyEquivalent(with: event)
+        }
+        keyDown(with: event)
+        return true
+    }
+
     public override func keyDown(with event: NSEvent) {
         kittyComposingKeyCode = nil
         if !event.isARepeat {
-            kittyKeysWithoutReportedPress.remove(event.keyCode)
+            kittyKeysWithReportedPress.remove(event.keyCode)
         }
+        let keyboardEnhancementFlags = withTerminal { $0.keyboardEnhancementFlags }
+        let terminalOwnsCommandKey = !keyboardEnhancementFlags.isEmpty
+            && event.modifierFlags.contains(.command)
+            && shouldSendCommandKeyToTerminal?(event) == true
+        // The host menu owns its shortcuts. If AppKit reaches keyDown before
+        // running a menu action, give the menu a chance before clearing the
+        // selection or encoding the key for the terminal application.
+        if event.modifierFlags.contains(.command),
+           !terminalOwnsCommandKey,
+           NSApp.mainMenu?.performKeyEquivalent(with: event) == true {
+            return
+        }
+        let previousKeyDownCode = kittyKeyDownCode
+        kittyKeyDownCode = event.keyCode
+        defer { kittyKeyDownCode = previousKeyDownCode }
         withTerminal { _ in
             selection.active = false
         }
         let eventFlags = event.modifierFlags
 
-        let terminalState = withTerminal { terminal in
-            (terminal.keyboardEnhancementFlags, terminal.applicationCursor)
+        let applicationCursor = withTerminal { $0.applicationCursor }
+
+        let isOptionAsMetaShortcut = eventFlags.contains([.option, .command])
+            && event.charactersIgnoringModifiers == "o"
+        if !keyboardEnhancementFlags.isEmpty,
+           eventFlags.contains(.command),
+           (!isOptionAsMetaShortcut || terminalOwnsCommandKey),
+           let kittyEvent = kittyKeyEvent(from: event,
+                                          eventType: event.isARepeat ? .repeatPress : .press),
+           sendKittyEvent(kittyEvent) {
+            return
         }
-        let keyboardEnhancementFlags = terminalState.0
 
         if keyboardEnhancementFlags.isEmpty,
            eventFlags.contains(.command),
@@ -2052,7 +2088,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             let modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
             let isUnmodifiedPageKey = (functionKey == .pageUp || functionKey == .pageDown)
                 && modifiers.intersection([.shift, .alt, .ctrl]).isEmpty
-                && !terminalState.1
+                && !applicationCursor
             if isUnmodifiedPageKey {
                 if functionKey == .pageUp {
                     pageUp()
@@ -2079,7 +2115,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 optionAsMetaKey.toggle()
                 // No press was reported for this key, so its release must
                 // not be reported either.
-                kittyKeysWithoutReportedPress.insert(event.keyCode)
                 return
             }
 
@@ -2092,7 +2127,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             // commit text or issue a command while it interprets this event. Do
             // not send the physical key as a second event.
             if kittyIsComposing {
-                kittyKeysWithoutReportedPress.insert(event.keyCode)
                 kittyComposingKeyCode = event.keyCode
                 interpretKeyEvents([event])
                 return
@@ -2260,14 +2294,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if kittyComposingKeyCode == event.keyCode {
             kittyComposingKeyCode = nil
         }
-        if kittyKeysWithoutReportedPress.remove(event.keyCode) != nil {
+        let hadReportedPress = kittyKeysWithReportedPress.remove(event.keyCode) != nil
+        if !hadReportedPress {
             super.keyUp(with: event)
             return
         }
         let flags = withTerminal { $0.keyboardEnhancementFlags }
         // Every key whose press reached the application gets a release,
-        // including plain text keys. Keys that sent no press are in
-        // kittyKeysWithoutReportedPress and returned above.
+        // including plain text keys.
         if flags.contains(.reportEvents),
            let kittyEvent = kittyKeyEvent(from: event, eventType: .release, text: nil) {
             if !flags.contains(.reportAllKeys),
@@ -2400,10 +2434,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         default:
             // Nothing is sent for this key. Under the kitty protocol its
             // release must not be reported without a press.
-            if let pending = pendingKittyKeyEvent {
-                kittyKeysWithoutReportedPress.insert(pending.event.keyCode)
-                pendingKittyKeyEvent = nil
-            }
+            pendingKittyKeyEvent = nil
             print ("Unhandle selector \(selector)")
         }
     }
@@ -2459,7 +2490,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                    !pendingEvent.event.modifierFlags.contains(.control),
                    !pendingEvent.event.modifierFlags.contains(.command),
                    isPlainPrintableText(text) {
-                    kittyKeysWithoutReportedPress.insert(pendingEvent.event.keyCode)
                     send(txt: text)
                     return
                 }
@@ -2472,7 +2502,16 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 } else {
                     kittyEvent = kittyTextEventFromText(text)
                 }
-                _ = sendKittyEvent(kittyEvent)
+                let wasSent = sendKittyEvent(kittyEvent)
+                if wasSent,
+                   terminalState.contains(.reportEvents),
+                   let pendingEvent {
+                    if case .none = kittyEvent.key {
+                        // Committed text has no physical key to release.
+                    } else {
+                        kittyKeysWithReportedPress.insert(pendingEvent.event.keyCode)
+                    }
+                }
                 return
             }
             send (txt: str as String)
@@ -2512,10 +2551,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     // NSTextInputClient protocol implementation
     open func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        if let pendingKittyKeyEvent {
-            kittyKeysWithoutReportedPress.insert(pendingKittyKeyEvent.event.keyCode)
-            self.pendingKittyKeyEvent = nil
-        }
+        pendingKittyKeyEvent = nil
         switch string {
         case let attributed as NSAttributedString:
             markedTextStorage = attributed.length > 0 ? attributed : nil
@@ -3044,8 +3080,19 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     @discardableResult
     private func sendKittyEvent(_ event: KittyKeyEvent) -> Bool {
-        guard let bytes = kittyEncoder().encode(event) else { return false }
+        let encoder = kittyEncoder()
+        guard let bytes = encoder.encode(event) else { return false }
         send(bytes)
+        if encoder.flags.contains(.reportEvents),
+           event.eventType != .release,
+           let keyCode = kittyKeyDownCode {
+            switch event.key {
+            case .none:
+                break
+            default:
+                kittyKeysWithReportedPress.insert(keyCode)
+            }
+        }
         return true
     }
 
@@ -3059,10 +3106,17 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                                   baseLayoutKey: nil,
                                   composing: kittyIsComposing)
         guard sendKittyEvent(event) else { return false }
+        if eventType != .release,
+           withTerminal({ $0.keyboardEnhancementFlags.contains(.reportEvents) }),
+           let pending = pendingKittyKeyEvent {
+            kittyKeysWithReportedPress.insert(pending.event.keyCode)
+        }
         // The input method forwarded the key that ended the preedit as a
         // command. Its press is now reported, so its release must be too.
         if let composingKeyCode = kittyComposingKeyCode {
-            kittyKeysWithoutReportedPress.remove(composingKeyCode)
+            if withTerminal({ $0.keyboardEnhancementFlags.contains(.reportEvents) }) {
+                kittyKeysWithReportedPress.insert(composingKeyCode)
+            }
         }
         return true
     }
@@ -3413,8 +3467,15 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         terminal.terminalLock.preconditionLocked()
         let flags = event.modifierFlags
         let isReleaseEvent = overwriteRelease || [NSEvent.EventType.leftMouseUp, .otherMouseUp, .rightMouseUp].contains(event.type)
-        
-        return terminal.encodeButton(button: event.buttonNumber, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+        // AppKit numbers the right button as 1 and the middle button as 2.
+        // Terminal mouse protocols use the reverse order.
+        let button: Int
+        switch event.buttonNumber {
+        case 1: button = 2
+        case 2: button = 1
+        default: button = event.buttonNumber
+        }
+        return terminal.encodeButton(button: button, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
     }
     
     func calculateMouseHit (with event: NSEvent) -> (grid: Position, pixels: Position)
@@ -3620,6 +3681,97 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         setNeedsDisplay(bounds)
     }
     
+    open override func rightMouseDown(with event: NSEvent) {
+        if shouldReportMouseEvent(with: event, when: { $0.sendButtonPress() }) {
+            sharedMouseEvent(with: event)
+        } else {
+            super.rightMouseDown(with: event)
+        }
+    }
+
+    open override func rightMouseUp(with event: NSEvent) {
+        if shouldReportMouseEvent(with: event, when: { $0.sendButtonRelease() }) {
+            sharedMouseEvent(with: event)
+        } else {
+            super.rightMouseUp(with: event)
+        }
+    }
+
+    open override func rightMouseDragged(with event: NSEvent) {
+        if !reportAuxiliaryMouseDrag(with: event) {
+            super.rightMouseDragged(with: event)
+        }
+    }
+
+    private func shouldReportMouseEvent(
+        with event: NSEvent,
+        when mouseModeAllows: (Terminal.MouseMode) -> Bool
+    ) -> Bool {
+        withTerminal { terminal in
+            allowMouseReporting && !shiftBypassesMouseReportingLocked(for: event)
+                && mouseModeAllows(terminal.mouseMode)
+        }
+    }
+
+    private func reportAuxiliaryMouseDrag(with event: NSEvent) -> Bool {
+        let point = convert(event.locationInWindow, from: nil)
+        return withTerminal { terminal -> Bool in
+            guard allowMouseReporting,
+                  !shiftBypassesMouseReportingLocked(for: event),
+                  terminal.mouseMode.sendButtonTracking() else { return false }
+            let displayBuffer = terminal.displayBuffer
+            let hit = calculateMouseHitLocked(at: point)
+            let flags = encodeMouseEventLocked(with: event)
+            let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+            terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: screenRow,
+                                pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+            return true
+        }
+    }
+
+    private func isReportableOtherMouseButton(_ event: NSEvent) -> Bool {
+        // AppKit reports the middle button as 2, which encodeMouseEventLocked maps
+        // to terminal button 1. Higher AppKit buttons are back/forward-style
+        // buttons, but SwiftTerm does not encode xterm's 128+ extended button
+        // range here; passing them through would misreport button 3 as left and
+        // buttons 4...7 as wheel events.
+        event.buttonNumber == 2
+    }
+
+    open override func otherMouseDown(with event: NSEvent) {
+        guard isReportableOtherMouseButton(event) else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        if shouldReportMouseEvent(with: event, when: { $0.sendButtonPress() }) {
+            sharedMouseEvent(with: event)
+        } else {
+            super.otherMouseDown(with: event)
+        }
+    }
+
+    open override func otherMouseUp(with event: NSEvent) {
+        guard isReportableOtherMouseButton(event) else {
+            super.otherMouseUp(with: event)
+            return
+        }
+        if shouldReportMouseEvent(with: event, when: { $0.sendButtonRelease() }) {
+            sharedMouseEvent(with: event)
+        } else {
+            super.otherMouseUp(with: event)
+        }
+    }
+
+    open override func otherMouseDragged(with event: NSEvent) {
+        guard isReportableOtherMouseButton(event) else {
+            super.otherMouseDragged(with: event)
+            return
+        }
+        if !reportAuxiliaryMouseDrag(with: event) {
+            super.otherMouseDragged(with: event)
+        }
+    }
+
     func getPayload (for event: NSEvent) -> Any?
     {
         let hit = calculateMouseHit(with: event).grid
@@ -4590,6 +4742,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     // Keep new stored properties at the end of the class. Moving the existing
     // render-path fields changes their Release layout and can reduce throughput.
     nonisolated let kittyClipboardBridge = AppleKittyClipboardBridge()
+
+    /// Return true to give a Command key equivalent to the terminal program
+    /// when it has enabled the enhanced keyboard protocol. The default lets
+    /// the host menu handle its shortcuts first.
+    public var shouldSendCommandKeyToTerminal: ((NSEvent) -> Bool)?
+
+    private var kittyKeysWithReportedPress: Set<UInt16> = []
+    private var kittyKeyDownCode: UInt16?
 }
 
 extension TerminalView: @MainActor NSTextInputClient {}

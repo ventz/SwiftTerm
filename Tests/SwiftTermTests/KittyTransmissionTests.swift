@@ -15,7 +15,12 @@ import Musl
 
 final class KittyTransmissionTests {
     #if !os(Windows)
+    #if canImport(Darwin)
+    // Darwin's public shm_open is variadic; call the fixed-arity syscall shim.
+    @_silgen_name("__shm_open")
+    #else
     @_silgen_name("shm_open")
+    #endif
     private static func swiftShmOpen(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32
     #endif
 
@@ -50,30 +55,8 @@ final class KittyTransmissionTests {
     }
 
     #if !os(Windows)
-    /// Creates a shared memory object readable by its owner. shm_open is
-    /// variadic in C, and on Apple arm64 variadic arguments go on the stack,
-    /// so the mode passed through the plain import above never arrives: the
-    /// object got whatever permissions were lying there, and later opens
-    /// failed with EACCES at random. Here the six unused argument registers
-    /// are filled so the mode lands in the first stack slot, where shm_open
-    /// reads it. fchmod cannot fix it afterwards; macOS refuses it on shared
-    /// memory.
-    private static func createSharedMemoryObject(name: String) -> Int32 {
-        let oflag = O_CREAT | O_EXCL | O_RDWR
-        #if canImport(Darwin) && arch(arm64)
-        typealias ShmOpen = @convention(c) (UnsafePointer<CChar>, Int32, Int, Int, Int, Int, Int, Int, Int) -> Int32
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "shm_open") else {  // RTLD_DEFAULT
-            return -1
-        }
-        let open = unsafeBitCast(symbol, to: ShmOpen.self)
-        return name.withCString { open($0, oflag, 0, 0, 0, 0, 0, 0, 0o600) }
-        #else
-        return name.withCString { KittyTransmissionTests.swiftShmOpen($0, oflag, 0o600) }
-        #endif
-    }
-
     private static func createSharedMemory(name: String, bytes: [UInt8]) -> (ok: Bool, errorCode: Int32) {
-        let fd = Self.createSharedMemoryObject(name: name)
+        let fd = name.withCString { KittyTransmissionTests.swiftShmOpen($0, O_CREAT | O_EXCL | O_RDWR, 0o600) }
         guard fd >= 0 else {
             return (false, errno)
         }
