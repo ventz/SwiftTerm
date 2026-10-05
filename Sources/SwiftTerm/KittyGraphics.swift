@@ -1337,7 +1337,8 @@ extension Terminal {
         guard !pathData.contains(0) else {
             return (nil, "EINVAL: bad payload")
         }
-        guard let name = String(data: pathData, encoding: .utf8) else {
+        guard let name = String(data: pathData, encoding: .utf8),
+              Terminal.isPlausibleSharedMemoryName(name) else {
             return (nil, "EINVAL: bad payload")
         }
 
@@ -1484,6 +1485,23 @@ extension Terminal {
     #endif
 
     #if !os(Windows) && !os(WASI)
+    /// The name must look like a POSIX shared memory object: one leading
+    /// slash, no other slash, printable ASCII, and short enough for the
+    /// platform. The name comes from terminal output, and reading an object
+    /// also unlinks it, so anything else is refused before it is opened.
+    static func isPlausibleSharedMemoryName(_ name: String) -> Bool {
+        #if canImport(Darwin)
+        let maxLength = 31   // PSHMNAMLEN
+        #else
+        let maxLength = 255  // NAME_MAX
+        #endif
+        let bytes = Array(name.utf8)
+        guard bytes.count >= 2, bytes.count <= maxLength, bytes[0] == UInt8(ascii: "/") else {
+            return false
+        }
+        return bytes.dropFirst().allSatisfy { $0 > 0x20 && $0 < 0x7f && $0 != UInt8(ascii: "/") }
+    }
+
     private func readKittySharedMemory(name: String, expectedSize: Int?, offset: Int, size: Int) -> Data? {
         guard offset >= 0, size >= 0 else {
             return nil
@@ -1496,7 +1514,6 @@ extension Terminal {
         }
         defer {
             close(fd)
-            _ = name.withCString { shm_unlink($0) }
         }
 
         var st = stat()
@@ -1513,14 +1530,16 @@ extension Terminal {
         if let expectedSize, statSize < expectedSize {
             return nil
         }
-        let effectiveExpectedSize = expectedSize ?? statSize
-
+        // S= counts from O=; without it, the image's own size does, or the
+        // rest of the object when the size is not known up front.
         let start = offset
         let end: Int
         if size > 0 {
-            end = min(offset + size, effectiveExpectedSize)
+            end = offset + size
+        } else if let expectedSize {
+            end = offset + expectedSize
         } else {
-            end = effectiveExpectedSize
+            end = statSize
         }
         guard start < end, end <= statSize else {
             return nil
@@ -1534,8 +1553,12 @@ extension Terminal {
             munmap(map, statSize)
         }
 
-        let startPtr = map.advanced(by: start)
-        return Data(bytes: startPtr, count: end - start)
+        let data = Data(bytes: map.advanced(by: start), count: end - start)
+        // Unlinked only once it was read as an image would be: an object
+        // that does not fit the request is left alone rather than deleted
+        // on the say-so of terminal output.
+        _ = name.withCString { shm_unlink($0) }
+        return data
     }
     #endif
 
